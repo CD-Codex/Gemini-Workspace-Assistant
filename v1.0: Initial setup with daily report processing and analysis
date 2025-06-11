@@ -1,0 +1,233 @@
+// --- CONFIGURATION ---
+const YOUR_EMAIL_ADDRESS = "Chris@qualitytaxplus.com";
+const YOUR_GOOGLE_DOC_ID = "12zGKuQ2FK7KTwXjl_4Q15UtqQSWkilJrNsLiSukadAY";
+const YOUR_TIMEZONE = "America/New_York";
+
+// --- SHEET & COLUMN SETUP ---
+const VA_ROSTER_SHEET_NAME = "VA Roster"; // Sheet with VA Names (Col A) and Emails (Col B)
+const FORM_RESPONSE_SHEET_NAME = "Form Responses 1"; // The sheet getting form responses
+
+// IMPORTANT: Adjust these column numbers to match your FORM RESPONSE sheet (A=0, B=1, C=2, etc.)
+const VA_NAME_COLUMN_INDEX = 3; // The column with the VA's SUBMITTED NAME. I've set it to Column C, please adjust.
+const VA_EMAIL_COLUMN_INDEX = 1; // The column with the VA's SUBMITTED EMAIL. I've set it to Column D, please adjust.
+
+// --- END OF CONFIGURATION ---
+
+
+/**
+ * =================================================================================================
+ * MASTER FUNCTION TO PROCESS DAILY REPORTS (Using Email Validation)
+ * =================================================================================================
+ */
+function processDailyReports() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const formSheet = spreadsheet.getSheetByName(FORM_RESPONSE_SHEET_NAME);
+  const rosterSheet = spreadsheet.getSheetByName(VA_ROSTER_SHEET_NAME);
+
+  if (!rosterSheet) {
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "SCRIPT ERROR", `The script could not find the VA Roster sheet named "${VA_ROSTER_SHEET_NAME}".`);
+    return;
+  }
+  if (!formSheet) {
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "SCRIPT ERROR", `The script could not find the Form Response sheet named "${FORM_RESPONSE_SHEET_NAME}".`);
+    return;
+  }
+
+  // --- 100% Accurate Email Matching Logic ---
+  let missingReportMessage = "";
+  // Create a map of {email: "Name"} from the roster. Reads columns A and B.
+  const rosterData = rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, 2).getValues();
+  const vaRosterMap = new Map(rosterData.map(row => [row[1].toLowerCase().trim(), row[0]])); // [email, name]
+  const expectedEmails = Array.from(vaRosterMap.keys());
+
+  const submittedData = getYesterdayData(formSheet);
+  const submittedEmails = submittedData.map(row => row[VA_EMAIL_COLUMN_INDEX] ? row[VA_EMAIL_COLUMN_INDEX].toLowerCase().trim() : "").filter(String);
+
+  const missingEmails = expectedEmails.filter(email => !submittedEmails.includes(email));
+
+  if (missingEmails.length > 0) {
+    const missingNames = missingEmails.map(email => vaRosterMap.get(email)); // Look up the name from the email
+    missingReportMessage = `🚨 ALERT: MISSING REPORTS 🚨\n\nThe following VAs did not submit a report yesterday:\n- ${missingNames.join("\n- ")}\n\n------------------------------------\n\n`;
+  }
+  // --- End of Email Matching Logic ---
+
+  if (submittedData.length === 0) {
+    const subject = "VA Daily Report Summary - No New Reports";
+    const body = missingReportMessage || "There were no new VA reports submitted yesterday.";
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, subject, body);
+    return;
+  }
+
+  const headers = formSheet.getRange(1, 1, 1, formSheet.getLastColumn()).getValues()[0];
+  let reportsText = "Here are the daily reports from my Virtual Assistants. The columns are: " + headers.join(", ") + "\n\n";
+  submittedData.forEach(row => { reportsText += row.join(", ") + "\n"; });
+
+  const dailyPrompt = `
+    You are a helpful management assistant. Your task is to analyze daily reports from a team of Virtual Assistants (VAs) and provide a clear, concise summary for the team leader.
+    Based on the following data, please do the following:
+    1. Provide a bullet-point summary for EACH VA mentioned in the reports. Mention their name clearly.
+    2. Highlight any significant accomplishments or "wins."
+    3. Identify any reported challenges, blockers, or questions the VAs had.
+    4. Create a brief "Overall Summary" at the end.
+
+    Here are the reports:
+    ${reportsText}
+  `;
+
+  try {
+    const dailySummary = callGeminiAPI(dailyPrompt);
+    let subject = `VA Daily Report Summary - ${new Date().toLocaleDateString()}`;
+    if (missingReportMessage) {
+      subject += " (Missing Reports Noted)";
+    }
+    const emailBody = missingReportMessage + "Here is your daily summary:\n\n" + dailySummary;
+
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, subject, emailBody);
+    
+    const doc = DocumentApp.openById(YOUR_GOOGLE_DOC_ID);
+    const body = doc.getBody();
+    body.appendParagraph(`Summary for ${new Date().toLocaleDateString()}`).setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    if (missingReportMessage) {
+      body.appendParagraph(missingReportMessage.replace("🚨 ALERT: MISSING REPORTS 🚨\n\n", "Missing Reports:\n"));
+    }
+    body.appendParagraph(dailySummary);
+    body.appendHorizontalRule();
+
+  } catch (e) {
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "SCRIPT ERROR", "The daily summary script encountered an error: " + e.toString());
+  }
+}
+
+/**
+ * =================================================================================================
+ * MASTER FUNCTION TO PROCESS WEEKLY REPORTS
+ * =================================================================================================
+ */
+function processWeeklyAnalysis() {
+  const doc = DocumentApp.openById(YOUR_GOOGLE_DOC_ID);
+  const weeklyData = doc.getBody().getText();
+
+  if (weeklyData.trim().length === 0) { return; }
+
+  const weeklyPrompt = `
+    You are an expert leadership and productivity coach. I am the leader of a team of Virtual Assistants.
+    I will provide you with a compilation of all the daily summaries from the past week.
+    Your task is to perform a comprehensive analysis and provide me, the leader, with actionable insights.
+    Please structure your analysis in the following sections:
+    1. **Overall Weekly Performance:** A brief overview of the team's productivity and mood this week.
+    2. **Individual Recognition:** Identify VAs who consistently performed well or had significant achievements. Suggest how I might acknowledge their work.
+    3. **Recurring Challenges & Bottlenecks:** Analyze the reports to find common problems, recurring obstacles, or questions that multiple VAs faced.
+    4. **Actionable Leadership To-Do List:** Based on everything, provide me with a concrete, bullet-pointed list of actions I should take.
+
+    Here is the data from the week:
+    ${weeklyData}
+  `;
+
+  try {
+    const weeklyAnalysis = callGeminiAPI(weeklyPrompt);
+    const subject = `Your Weekly VA Team Leadership Analysis`;
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, subject, weeklyAnalysis);
+  } catch (e) {
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "SCRIPT ERROR", "The weekly analysis script encountered an error: " + e.toString());
+  }
+}
+
+/**
+ * =================================================================================================
+ * MASTER FUNCTION FOR HISTORICAL IMPORT
+ * =================================================================================================
+ */
+function processAllReportsSinceJune4th() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const formSheet = spreadsheet.getSheetByName(FORM_RESPONSE_SHEET_NAME);
+  const historicalData = getDataSinceJune4th(formSheet);
+
+  if (historicalData.length === 0) {
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "Historical VA Report - No Data Found", "Could not find any VA reports submitted since June 4th, 2025.");
+    return;
+  }
+
+  const headers = formSheet.getRange(1, 1, 1, formSheet.getLastColumn()).getValues()[0];
+  let reportsText = "Here are all the daily reports from my Virtual Assistants since June 4th, 2025. The columns are: " + headers.join(", ") + "\n\n";
+  historicalData.forEach(row => { reportsText += row.join(", ") + "\n"; });
+
+  const historicalPrompt = `
+    You are a helpful management assistant. Your task is to analyze a batch of historical daily reports from a team of Virtual Assistants (VAs) and provide one large, consolidated summary for the team leader.
+    The data covers the period from June 4th, 2025 to the present.
+    Based on the following data, please do the following:
+    1. For each major date or work period, provide a high-level summary of what was accomplished.
+    2. Identify any VAs who had significant accomplishments or recurring challenges throughout this entire period.
+    3. Create a brief "Overall Summary" at the very end that covers the entire period.
+
+    Here are all the reports:
+    ${reportsText}
+  `;
+
+  try {
+    const historicalSummary = callGeminiAPI(historicalPrompt);
+    const subject = `VA Report Summary: June 4th - Present`;
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, subject, "This is a one-time summary of all reports since June 4th.\n\n" + historicalSummary);
+    
+    const doc = DocumentApp.openById(YOUR_GOOGLE_DOC_ID);
+    const body = doc.getBody();
+    body.appendParagraph(`Consolidated Summary for June 4th, 2025 - Present`).setHeading(DocumentApp.ParagraphHeading.HEADING1);
+    body.appendParagraph(historicalSummary);
+    body.appendHorizontalRule();
+  } catch (e) {
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "SCRIPT ERROR", "The historical summary script encountered an error: " + e.toString());
+  }
+}
+
+
+/**
+ * =================================================================================================
+ * HELPER FUNCTIONS (These support the main functions above)
+ * =================================================================================================
+ */
+function getYesterdayData(sheet) {
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  const now = new Date();
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const endOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  return values.filter((row, index) => {
+    if (index === 0 || !row[0]) return false;
+    const timestamp = new Date(row[0]);
+    return timestamp >= yesterday && timestamp < endOfYesterday;
+  });
+}
+
+function getDataSinceJune4th(sheet) {
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  const startDate = new Date(2025, 5, 4); // June is month 5 (0-indexed)
+
+  return values.filter((row, index) => {
+    if (index === 0 || !row[0]) return false;
+    const timestamp = new Date(row[0]);
+    return timestamp >= startDate;
+  });
+}
+
+function callGeminiAPI(prompt) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('API_key');
+  if (!apiKey) {
+    throw new Error("API_key not found in Script Properties. Please add it in Project Settings.");
+  }
+
+  const model = 'gemini-1.5-flash-latest';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const payload = { contents: [{ parts: [{ text: prompt }] }] };
+  const options = { method: 'post', contentType: 'application/json', muteHttpExceptions: true, payload: JSON.stringify(payload) };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const responseText = response.getContentText();
+  
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`Gemini API Error: ${responseText}`);
+  }
+  const parsedResponse = JSON.parse(responseText);
+  return parsedResponse.candidates[0].content.parts[0].text;
+}
