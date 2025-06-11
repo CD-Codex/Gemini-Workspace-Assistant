@@ -1,0 +1,286 @@
+// =================================================================================================
+// --- CONFIGURATION ---
+// =================================================================================================
+
+const YOUR_EMAIL_ADDRESS = "Chris@qualitytaxplus.com";
+const STRATEGY_JOURNAL_DOC_ID = "1IoEcUeF95FFopvE9ScvCwXKxUPCFAk0XLlC0ZxZ8OE4";
+const YOUR_TIMEZONE = "America/New_York"; // This will now be used for date calculations
+
+// --- SHEET & COLUMN SETUP ---
+const VA_ROSTER_SHEET_NAME = "VA Roster"; // Sheet with VA Names (Col A) and Emails (Col B)
+const FORM_RESPONSE_SHEET_NAME = "Form Responses 1"; // The sheet getting form responses
+const DATA_LOG_SHEET_NAME = "Knowledge Hub"; // The sheet where structured data will be saved
+
+// IMPORTANT: Columns in your Form Response sheet (A=0, B=1, C=2, etc.)
+const VA_EMAIL_COLUMN_INDEX = 1; // Column B has the VA's Email
+const VA_NAME_COLUMN_INDEX = 3;  // Column D has the VA's Name
+
+
+// =================================================================================================
+// --- 1. MAIN FUNCTION - DAILY PROCESS (FINAL POLISHED VERSION 1.3) ---
+// =================================================================================================
+function processDailyReports() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const formSheet = spreadsheet.getSheetByName(FORM_RESPONSE_SHEET_NAME);
+  const dataLogSheet = spreadsheet.getSheetByName(DATA_LOG_SHEET_NAME);
+  const rosterSheet = spreadsheet.getSheetByName(VA_ROSTER_SHEET_NAME);
+
+  // --- A. Accurate Email Matching Logic ---
+  const rosterData = rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, 2).getValues();
+  const vaRosterMap = new Map(rosterData.map(row => [row[1].toLowerCase().trim(), row[0]]));
+  const expectedEmails = Array.from(vaRosterMap.keys());
+
+  const submittedData = getYesterdayData(formSheet); // This now uses the timezone-aware function
+  const submittedEmails = submittedData.map(row => row[VA_EMAIL_COLUMN_INDEX] ? row[VA_EMAIL_COLUMN_INDEX].toLowerCase().trim() : "").filter(String);
+  const missingEmails = expectedEmails.filter(email => !submittedEmails.includes(email));
+  let missingReportHtml = "";
+  if (missingEmails.length > 0) {
+    const missingNames = missingEmails.map(email => vaRosterMap.get(email) || "Unknown");
+    missingReportHtml = `<h2 class="section-title missing">🚨 Missing Reports</h2><ul><li>${missingNames.join("</li><li>")}</li></ul><hr>`;
+  }
+
+  if (submittedData.length === 0) {
+    if(missingReportHtml){
+       MailApp.sendEmail({ to: YOUR_EMAIL_ADDRESS, subject: "VA Daily Summary: Missing Reports", htmlBody: buildEmailShell(missingReportHtml)});
+    }
+    return;
+  }
+
+  // --- B. Process Each Submitted Report ---
+  let individualVaHtmlSnippets = [];
+  let allReportsTextForOverallSummary = "";
+  const headers = formSheet.getRange(1, 1, 1, formSheet.getLastColumn()).getValues()[0];
+
+  for (const reportRow of submittedData) {
+    const vaEmail = reportRow[VA_EMAIL_COLUMN_INDEX].toLowerCase().trim();
+    const vaName = vaRosterMap.get(vaEmail) || reportRow[VA_NAME_COLUMN_INDEX];
+    const reportTimestamp = new Date(reportRow[0]);
+    const productivityRating = reportRow.find((val, i) => headers[i].toLowerCase().includes('productivity'));
+
+    const reportText = headers.map((header, i) => `${header}: ${reportRow[i]}`).join("\n");
+    allReportsTextForOverallSummary += `Report from ${vaName}:\n${reportText}\n---\n`;
+
+    // --- FINAL, UPGRADED PROMPT V1.3 ---
+    const extractionPrompt = `
+      Analyze the following daily report. Extract key information into a structured JSON format.
+      The JSON object MUST have TWO top-level keys: "database" and "emailSummary".
+
+      1.  The "database" key should contain an object for data logging with: "tasks" (an array of objects, each with "taskName" and "projectName"), and "sentiment" (Positive, Neutral, or Negative).
+      2.  The "emailSummary" key should contain an object for a rich email summary with these keys: "wins" (a string summarizing wins), "challenges" (a string summarizing challenges), "productivityAnalysis" (a string analyzing their self-reported productivity rating), and "aiToolUsage" (a string describing AI tool usage), and "tasksCompletedHTML" (a string of HTML using only <ul> and <li> tags listing the tasks).
+
+      Here is the report:
+      ---
+      ${reportText}
+      ---
+      
+      Provide only the single, valid JSON object in your response.
+    `;
+    
+    try {
+      const jsonString = callGeminiAPI(extractionPrompt, 'gemini-1.5-flash-latest');
+      const extractedData = JSON.parse(jsonString.replace(/```json|```/g, '').trim());
+
+      const dbData = extractedData.database;
+      const emailData = extractedData.emailSummary;
+      
+      const individualHtml = `
+        <div class="va-card">
+          <h3>${vaName}</h3>
+          <p class="wins"><strong>Wins:</strong> ${emailData.wins || "None specified."}</p>
+          <p class="challenges"><strong>Challenges:</strong> ${emailData.challenges || "None reported."}</p>
+          <p><strong>AI Tool Usage:</strong> ${emailData.aiToolUsage || "Not specified."}</p>
+          <p><strong>Productivity Analysis:</strong> ${emailData.productivityAnalysis || "Not analyzed."}</p>
+          <strong class="tasks-title">Tasks Completed:</strong>
+          ${emailData.tasksCompletedHTML || "<ul><li>No specific tasks were extracted.</li></ul>"}
+        </div>
+      `;
+      individualVaHtmlSnippets.push(individualHtml);
+
+      if (dbData && Array.isArray(dbData.tasks)) {
+        for (const task of dbData.tasks) {
+          dataLogSheet.appendRow([
+            Utilities.getUuid(), reportTimestamp, "Daily Report", vaName, vaEmail, 
+            task.projectName || "N/A", task.taskName || "N/A", null, productivityRating || null,
+            dbData.sentiment || "N/A", emailData.aiToolUsage || "N/A", emailData.challenges || "N/A", emailData.wins || "N/A", reportText
+          ]);
+        }
+      } else {
+         Logger.log(`No tasks array found in AI response for ${vaName}.`);
+         dataLogSheet.appendRow([
+            Utilities.getUuid(), reportTimestamp, "Daily Report", vaName, vaEmail, 
+            "N/A", "Processing Error/No Tasks", null, productivityRating || null,
+            dbData ? dbData.sentiment || "N/A" : "N/A", emailData.aiToolUsage || "N/A", emailData.challenges || "N/A", emailData.wins || "N/A", reportText
+          ]);
+      }
+    } catch (e) {
+      Logger.log(`Could not process report for ${vaName}. Error: ${e.toString()}`);
+      individualVaHtmlSnippets.push(`<div class="va-card error"><h3>${vaName}</h3><p><i>Could not automatically process this report due to an error.</i></p></div>`);
+    }
+  }
+
+  // --- C. Generate Overall Summary (AFTER processing all individuals) ---
+  let overallSummaryHtml = "";
+  if (allReportsTextForOverallSummary) {
+    const overallSummaryPrompt = `Based on all of the following daily reports from my team, please provide a concise, high-level "Overall Summary" for the day. Mention any critical cross-team blockers or standout themes. Start with a <h2> tag. Here are the reports:\n\n${allReportsTextForOverallSummary}`;
+    try {
+      overallSummaryHtml = callGeminiAPI(overallSummaryPrompt, 'gemini-1.5-flash-latest');
+    } catch(e) {
+      overallSummaryHtml = "<h2>Overall Summary</h2><p>Could not generate the overall summary due to an error.</p>";
+    }
+  }
+
+  // --- D. Assemble and Send the Final Email ---
+  const individualSummariesHtml = `<h2 class="section-title">✅ Individual Summaries</h2>${individualVaHtmlSnippets.join('')}`;
+  const finalHtmlBody = buildEmailShell(overallSummaryHtml + missingReportHtml + individualSummariesHtml);
+  MailApp.sendEmail({ to: YOUR_EMAIL_ADDRESS, subject: "VA Daily Report Summary", htmlBody: finalHtmlBody });
+}
+
+
+// =================================================================================================
+// --- 2. MAIN FUNCTION - WEEKLY PROCESS ---
+// =================================================================================================
+function processWeeklyAnalysis() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const dataLogSheet = spreadsheet.getSheetByName(DATA_LOG_SHEET_NAME);
+  if (!dataLogSheet) { MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "SCRIPT ERROR", "Could not find 'Knowledge Hub' sheet."); return; }
+  
+  const strategyDoc = DocumentApp.openById(STRATEGY_JOURNAL_DOC_ID);
+  const strategyContext = strategyDoc.getBody().getText();
+
+  const weeklyData = getLast7DaysData(dataLogSheet);
+  if (weeklyData.length <= 1) { return; } 
+  const weeklyDataHeaders = dataLogSheet.getRange(1, 1, 1, dataLogSheet.getLastColumn()).getValues()[0];
+  const weeklyDataAsText = weeklyData.slice(1).map(row => {
+    return weeklyDataHeaders.map((header, i) => `${header}: ${row[i]}`).join(", ");
+  }).join("\n");
+
+  const weeklyPrompt = `
+    You are a Senior Business Analyst and Leadership Coach. Your task is to provide a strategic review for a team leader.
+    
+    First, here is the leader's high-level strategy and objectives from their journal:
+    --- STRATEGY CONTEXT ---
+    ${strategyContext}
+    ---
+    
+    Next, here is the structured data of all tasks completed by the team over the past 7 days:
+    --- WEEKLY DATA ---
+    ${weeklyDataAsText}
+    ---
+
+    Based on BOTH of these documents, please provide a concise, actionable analysis in HTML format... (rest of prompt is unchanged)
+  `;
+
+  try {
+    const weeklyAnalysisHtml = callGeminiAPI(weeklyPrompt, 'gemini-1.5-pro-latest');
+    MailApp.sendEmail({ to: YOUR_EMAIL_ADDRESS, subject: "Your Weekly Strategic Analysis is Ready", htmlBody: buildEmailShell(weeklyAnalysisHtml) });
+  } catch(e) {
+    MailApp.sendEmail(YOUR_EMAIL_ADDRESS, "SCRIPT ERROR", "The weekly analysis script encountered an error: " + e.toString());
+  }
+}
+
+
+// =================================================================================================
+// --- 3. MAIN FUNCTION - SUNDAY REMINDER ---
+// =================================================================================================
+function sendSundayReminder() {
+  const subject = "🔔 Reminder: Weekly Strategy & Objectives Review";
+  const sheetUrl = SpreadsheetApp.getActiveSpreadsheet().getUrl();
+  const docUrl = `https://docs.google.com/document/d/${STRATEGY_JOURNAL_DOC_ID}/edit`;
+
+  const htmlBody = `
+    <h2>It's time for your weekly strategic review!</h2>
+    <p>Take a few moments to update your goals and thoughts for the upcoming week.</p>
+    <ul>
+      <li><a href="${docUrl}">Update Your Strategy Journal</a></li>
+      <li><a href="${sheetUrl}">Review Team Data & Dashboards</a></li>
+    </ul>
+    <p>A clear strategy sets the team up for a successful week.</p>
+  `;
+  
+  MailApp.sendEmail({ to: YOUR_EMAIL_ADDRESS, subject: subject, htmlBody: buildEmailShell(htmlBody) });
+}
+
+
+// =================================================================================================
+// --- HELPER FUNCTIONS ---
+// =================================================================================================
+
+function buildEmailShell(content) {
+  const css = `
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; }
+      .container { max-width: 680px; margin: 0 auto; padding: 20px; background-color: #f9f9f9; border-radius: 8px; }
+      .section-title { border-bottom: 2px solid #eee; padding-bottom: 5px; margin-bottom: 15px; }
+      .missing { color: #c0392b; }
+      .va-card { background-color: #fff; border-left: 4px solid #3498db; padding: 15px; margin-bottom: 20px; border-radius: 0 4px 4px 0; }
+      .va-card.error { border-left-color: #e74c3c; }
+      h2 { color: #2c3e50; }
+      h3 { margin-bottom: 10px; color: #34495e; }
+      p { margin: 5px 0; font-size: 15px; }
+      ul { margin-top: 10px; padding-left: 20px; }
+      li { margin-bottom: 5px; }
+      strong { color: #555; }
+      .wins { color: #27ae60; }
+      .challenges { color: #e67e22; }
+      .tasks-title { margin-top: 15px; display: block; font-weight: bold; }
+    </style>
+  `;
+  return `<html lang="en"><head>${css}</head><body><div class="container">${content}</div></body></html>`;
+}
+
+// --- THIS IS THE UPDATED, TIMEZONE-AWARE FUNCTION ---
+function getYesterdayData(sheet) {
+  const values = sheet.getDataRange().getValues();
+  
+  // Get the start of today in the specified timezone
+  const today = new Date();
+  const todayStr = Utilities.formatDate(today, YOUR_TIMEZONE, "yyyy-MM-dd");
+  const startOfToday = new Date(todayStr + "T00:00:00");
+
+  // The end of yesterday is the start of today
+  const endOfYesterday = startOfToday;
+  
+  // The start of yesterday is 24 hours before that
+  const startOfYesterday = new Date(endOfYesterday.getTime() - (24 * 60 * 60 * 1000));
+
+  return values.filter((row, index) => {
+    if (index === 0 || !row[0]) return false;
+    const timestamp = new Date(row[0]);
+    return timestamp >= startOfYesterday && timestamp < endOfYesterday;
+  });
+}
+
+function getLast7DaysData(sheet) {
+  const values = sheet.getDataRange().getValues();
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7);
+
+  return values.filter((row, index) => {
+    if (index === 0) return true;
+    if (!row[1]) return false; 
+    const timestamp = new Date(row[1]);
+    return timestamp >= sevenDaysAgo;
+  });
+}
+
+function callGeminiAPI(prompt, model = 'gemini-1.5-flash-latest') {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('API_key');
+  if (!apiKey) { throw new Error("API_key not found in Script Properties."); }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const payload = { contents: [{ parts: [{ text: prompt }] }] };
+  const options = { method: 'post', contentType: 'application/json', muteHttpExceptions: true, payload: JSON.stringify(payload) };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const responseText = response.getContentText();
+  
+  if (response.getResponseCode() !== 200) { throw new Error(`Gemini API Error: ${responseText}`); }
+  const parsedResponse = JSON.parse(responseText);
+  
+  if (parsedResponse.candidates && parsedResponse.candidates[0]?.content?.parts?.[0]?.text) {
+     return parsedResponse.candidates[0].content.parts[0].text;
+  } else {
+    Logger.log("Gemini response was empty or in an unexpected format: " + responseText);
+    return "";
+  }
+}
